@@ -62,7 +62,7 @@ Anla 旨在构建一个不依赖传统实数自动微分框架的**全复数神�
 
 * **实现**: `Anla.layers.normalization.ComplexRMSNorm`
 * **公式**:
-  $$ z_{out} = \frac{z}{\sqrt{\text{mean}(|z|^2) + \epsilon}} \cdot S $$
+  $z_{out} = \frac{z}{\sqrt{\text{mean}(|z|^2) + \epsilon}} \cdot S$
 
   * $S$ 是可学习实数缩放因子。
 * **作用**: **至关重要**。它强制将层间信号的模长约束在单位球附近。没有它，Hebbian 网络会瞬间发散。它解耦了“能量”与“相位信息”。
@@ -71,7 +71,7 @@ Anla 旨在构建一个不依赖传统实数自动微分框架的**全复数神�
 
 * **实现**: `Anla.layers.attention.ComplexAttention`
 * **核心逻辑**: **埃尔米特内积 (Hermitian Inner Product)**
-  $$ \text{Score} = \text{Re}(Q \cdot K^H) $$
+  $\text{Score} = \text{Re}(Q \cdot K^H)$
 
   * 取实部意味着：关注相位的一致性 ($|Q||K|\cos(\Delta\theta)$)。
   * **天然位置编码**: 复数乘法天然包含旋转相对性，无需额外的 RoPE。

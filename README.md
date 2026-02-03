@@ -1,7 +1,9 @@
 # 🛸 Project Anla：全原生复数 AGI 核心引擎技术档案
 
 **版本**: Kernel v1.5 / Transformer Integration Alpha
+
 **日期**: 2026-02-03
+
 **状态**: 核心模块验证完成，Transformer 集成测试中（遭遇能量爆炸问题）
 
 ---

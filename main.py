@@ -1,137 +1,140 @@
 import torch
-import numpy as np
 import time
 import matplotlib.pyplot as plt
-import os
-import sys
 
-# 导入我们构建的模块
+# 导入核心组件 (保持不变)
 from Anla.layers.embedding import ComplexEmbedding
 from Anla.layers.linear import ComplexLinear
 from Anla.layers.activation import PhaseTwist
 from Anla.layers.normalization import ComplexRMSNorm
 
-def run_anla_test():
-    # --- 0. 设备配置 ---
-    # [紧急修正] 强制使用 CPU。
-    # RTX 5070 (sm_120) 目前太新，PyTorch Stable 版本尚未支持其 CUDA 内核。
-    # 待 PyTorch Nightly 更新支持 sm_120 后，可改回 'cuda'。
-    device = torch.device('cpu') 
-    print(f"Running Anla on device: {device} (Forced due to RTX 5070 compatibility)")
+def run_pure_physics_test():
+    # --- 0. 环境 ---
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Running Anla Pure Test on: {device}")
 
-    # --- 1. 超参数配置 ---
-    WEIGHT_DECAY = 1e-4 
+    # --- 1. 物理参数修正 ---
+    # [核心修正 A] 关闭耗散
+    # 既然这个任务是强行记忆随机映射，初始信号很弱，
+    # 我们不能让 Weight Decay 杀死微弱的萌芽。
+    WEIGHT_DECAY = 0.0     
+    
     VOCAB_SIZE = 100
-    DIM = 64            
-    BATCH_SIZE = 32     
-    SEQ_LEN = 10
-    LEARNING_RATE = 0.002 # CPU 上批次较慢，稍微提高学习率以更快看到收敛
-    EPOCHS = 10000         # CPU 跑 100 轮足够验证收敛性了
+    DIM = 64
+    BATCH_SIZE = 32
+    # 这是一个极其简单的任务，不需要序列，只需要点对点映射
+    # 为了验证组件能力，我们模拟最纯粹的 N -> N+1
     
-    print(f"\nInitializing Anla Core...")
-    print(f"Architecture: Embedding({DIM}) -> PhaseTwist -> Linear({DIM}) -> PhaseTwist")
+    LEARNING_RATE = 0.005 # 适中的学习率
+    EPOCHS = 2000
     
-    # --- 2. 实例化层 ---
+    # --- 2. 架构：最原始的堆叠 (No Residuals) ---
+    # 如果组件是好的，它们应该能直接传导梯度
+    print("Architecture: Embed -> [Lin->Norm->Act] x2 -> Loss")
+    
     embed = ComplexEmbedding(VOCAB_SIZE, DIM).to(device)
     
-    # Layer 1
-    linear1 = ComplexLinear(DIM, DIM).to(device)
-    norm1 = ComplexRMSNorm(DIM).to(device) # [新增]
-    act1 = PhaseTwist(DIM, init_gamma=0.01).to(device)
+    linear1 = ComplexLinear(DIM, DIM, mode='descent').to(device)
+    norm1 = ComplexRMSNorm(DIM).to(device)
+    act1 = PhaseTwist(DIM).to(device)
     
-    # Layer 2
-    linear2 = ComplexLinear(DIM, DIM).to(device)
-    norm2 = ComplexRMSNorm(DIM).to(device) # [新增]
-    act2 = PhaseTwist(DIM, init_gamma=0.01).to(device)
-    
-    # --- 3. 构造虚拟数据 ---
-    input_ids = torch.randint(0, VOCAB_SIZE - 1, (BATCH_SIZE, SEQ_LEN)).to(device)
-    target_ids = input_ids + 1
+    linear2 = ComplexLinear(DIM, DIM, mode='descent').to(device)
+    norm2 = ComplexRMSNorm(DIM).to(device)
+    act2 = PhaseTwist(DIM).to(device)
+
+    # --- 3. 数据 ---
+    # 构造固定的映射任务：Input ID -> Target ID
+    # 这是一个确定性任务，模型理应能学会
+    input_ids = torch.randint(0, VOCAB_SIZE, (BATCH_SIZE, 5)).to(device) # SeqLen=5
+    target_ids = (input_ids + 1) % VOCAB_SIZE
     
     loss_history = []
-    gamma_history = []
+    mag_history = []
     
-    print(f"\nStarting Training Loop (Manual Backpropagation)...")
-    start_time = time.time()
+    print("\nStarting Dynamics Simulation...")
     
     for epoch in range(EPOCHS):
-        # === Forward ===
+        # === Forward Path ===
+        # 1. Embedding
         x0 = embed.forward(input_ids)
-        x0_flat = x0.view(-1, DIM)
+        # Flatten for MLP: (Batch * Seq, Dim)
+        x_flat = x0.view(-1, DIM)
         
-        # Block 1
-        z1 = linear1.forward(x0_flat)
-        n1 = norm1.forward(z1)    # Linear -> Norm
-        a1 = act1.forward(n1)     # Norm -> Act
+        # 2. Layer 1
+        z1 = linear1.forward(x_flat)
+        n1 = norm1.forward(z1)
+        a1 = act1.forward(n1)
         
-        # Block 2
+        # 3. Layer 2
         z2 = linear2.forward(a1)
-        n2 = norm2.forward(z2)    # Linear -> Norm
-        a2 = act2.forward(n2)     # Norm -> Act (Prediction)
+        n2 = norm2.forward(z2)
+        a2 = act2.forward(n2)
         
-        # 4. 获取 Target (Ground Truth)
+        # === Output & Loss ===
+        logits = a2
+        
+        # Target: 也是从 Embedding 取出的单位向量
+        # 注意：这里我们detach，因为target是作为"地标"存在的
         target_vecs = embed.forward(target_ids).detach().view(-1, DIM)
         
-        # ================= Error Calculation =================
-        delta_out = target_vecs - a2
+        # [核心修正 B] 几何正确的梯度
+        # 我们要让 Prediction 靠近 Target。
+        # MSE Loss 的梯度方向是 (Pred - Target)。
+        # Linear(mode='descent') 执行 W -= lr * grad。
+        # 组合：W -= lr * (Pred - Target)  ==> W += lr * (Target - Pred)
+        # 这是物理正确的吸引力。
+        grad_out = logits - target_vecs
         
-        # 记录 Loss (标量)
-        loss_scalar = 0.5 * torch.mean(torch.abs(delta_out)**2).item()
-        loss_history.append(loss_scalar)
+        # 计算 Loss 用于观察 (MSE)
+        # Loss = 0.5 * |Pred - Target|^2
+        current_loss = 0.5 * torch.mean((logits - target_vecs).abs().pow(2)).item()
+        loss_history.append(current_loss)
         
-        # === Backward ===
-        # 记得把 norm 层的 backward 加进去
+        # === Backward Path (Manual) ===
+        # 没有任何残差连接，全靠组件传导
         
-        # Block 2 Backward
-        grad_n2 = act2.manual_backward(delta_out, LEARNING_RATE)
-        grad_z2 = norm2.manual_backward(grad_n2, LEARNING_RATE) # [新增]
+        # Layer 2 Backward
+        grad_n2 = act2.manual_backward(grad_out, LEARNING_RATE)
+        grad_z2 = norm2.manual_backward(grad_n2, LEARNING_RATE)
         grad_a1 = linear2.manual_backward(grad_z2, LEARNING_RATE, weight_decay=WEIGHT_DECAY)
         
-        # Block 1 Backward
+        # Layer 1 Backward
         grad_n1 = act1.manual_backward(grad_a1, LEARNING_RATE)
-        grad_z1 = norm1.manual_backward(grad_n1, LEARNING_RATE) # [新增]
+        grad_z1 = norm1.manual_backward(grad_n1, LEARNING_RATE)
         grad_x0 = linear1.manual_backward(grad_z1, LEARNING_RATE, weight_decay=WEIGHT_DECAY)
         
-        # ================= Monitoring =================
-        # 简单的文本进度条
-        if epoch % 10 == 0:
-            gamma_val = act2.gamma.mean().item()
-            gamma_history.append(gamma_val)
-            # 计算速度
-            elapsed = time.time() - start_time
-            speed = (epoch + 1) / (elapsed + 1e-5)
-            print(f"Epoch {epoch:03d}/{EPOCHS} | Loss: {loss_scalar:.6f} | Gamma: {gamma_val:.5f} | Speed: {speed:.1f} it/s")
+        # Embedding Backward
+        # [核心修正 C] 闭环：必须更新 Embedding
+        # 否则模型只能调整中间层去匹配两个随机向量，难度极大
+        embed.manual_backward(grad_x0, LEARNING_RATE)
+        
+        # === Monitoring ===
+        if epoch % 100 == 0:
+            # 监控输出模长。如果死掉，mag -> 0。
+            # 正常的 ComplexRMSNorm 应该把模长维持在 1.0 * Scale (初始1.0)
+            mag = logits.abs().mean().item()
+            mag_history.append(mag)
+            print(f"Epoch {epoch:04d} | Loss: {current_loss:.6f} | Mag: {mag:.4f}")
 
-    total_time = time.time() - start_time
-    print(f"\nTraining Finished in {total_time:.2f}s.")
-    print(f"Final Loss: {loss_scalar:.6f}")
+    print(f"Final Loss: {current_loss:.6f}")
     
-    # 可视化
-    if 'DISPLAY' in os.environ or os.name == 'nt':
-        try:
-            plt.figure(figsize=(12, 5))
-            
-            plt.subplot(1, 2, 1)
-            plt.plot(loss_history, label='MSE Loss')
-            plt.title("Anla Training Dynamics")
-            plt.xlabel("Epoch")
-            plt.ylabel("Loss")
-            plt.yscale('log')
-            plt.grid(True, which="both", ls="-", alpha=0.5)
-            plt.legend()
-            
-            plt.subplot(1, 2, 2)
-            plt.plot(gamma_history, color='orange', label='Twist Factor (Gamma)')
-            plt.title("Phase Twist Evolution")
-            plt.xlabel("Epoch (x10)")
-            plt.grid(True)
-            plt.legend()
-            
-            plt.tight_layout()
-            plt.show()
-            print("Plot displayed successfully.")
-        except Exception as e:
-            print(f"Plotting failed: {e}")
+    # 验证是否真的学会了
+    if current_loss < 0.1:
+        print("\n[SUCCESS] The pure stack learned the mapping!")
+    else:
+        print("\n[FAILURE] Dynamics failed to converge.")
+
+    # Plot
+    plt.figure(figsize=(10, 4))
+    plt.subplot(1, 2, 1)
+    plt.plot(loss_history)
+    plt.title('Loss (No Weight Decay)')
+    plt.yscale('log')
+    
+    plt.subplot(1, 2, 2)
+    plt.plot(mag_history)
+    plt.title('Output Magnitude')
+    plt.show()
 
 if __name__ == "__main__":
-    run_anla_test()
+    run_pure_physics_test()

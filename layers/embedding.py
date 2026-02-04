@@ -1,53 +1,63 @@
 import torch
 import torch.nn as nn
-import numpy as np
 from Anla.core.base_layer import ComplexLayer
+from Anla.utils.complex_ops import complex_kaiming_normal_
 
 class ComplexEmbedding(ComplexLayer):
-    def __init__(self, num_embeddings: int, embedding_dim: int):
+    """
+    [GPU Ready + High Viscosity]
+    """
+    def __init__(self, num_embeddings, embedding_dim):
         super().__init__()
         self.num_embeddings = num_embeddings
         self.embedding_dim = embedding_dim
-        self.weight = nn.Parameter(torch.randn(num_embeddings, embedding_dim, dtype=torch.complex64))
-        self.reset_parameters()
         
-    def reset_parameters(self):
-        with torch.no_grad():
-            phase = torch.empty_like(self.weight.real).uniform_(-np.pi, np.pi)
-            scale = np.sqrt(1 / self.embedding_dim)
-            magnitude = torch.sqrt(torch.empty_like(self.weight.real).exponential_(1.0)) * scale
-            self.weight.data = torch.polar(magnitude, phase)
+        weight_real = torch.empty(num_embeddings, embedding_dim)
+        weight_imag = torch.empty(num_embeddings, embedding_dim)
+        complex_kaiming_normal_(weight_real, weight_imag)
+        
+        raw_w = torch.complex(weight_real, weight_imag)
+        init_w = raw_w / (raw_w.abs() + 1e-9)
+        self.weight = nn.Parameter(init_w)
+        
+        # [FIX 1] 1e-5 -> 1e-3
+        self.register_buffer('weight_energy', torch.full((num_embeddings, embedding_dim), 1e-3, dtype=torch.float32))
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-        self.input_cache = input_ids.detach().clone()
-        return self.weight[input_ids]
-
-    def manual_backward(self, grad_output: torch.Tensor, learning_rate: float, weight_decay: float = 1e-4) -> torch.Tensor:
-        indices = self.input_cache
-        grad_flat = grad_output.view(-1, self.embedding_dim)
-        indices_flat = indices.view(-1)
-        
-        if indices_flat.device != self.weight.device:
-            indices_flat = indices_flat.to(self.weight.device)
-            
+        self.input_cache = input_ids if self.training else None
         with torch.no_grad():
-            # 1. 稀疏权重衰减
-            active_weights = self.weight.index_select(0, indices_flat)
-            decay_delta = - active_weights * weight_decay
+            return nn.functional.embedding(input_ids, self.weight)
+
+    def manual_backward(self, grad_output: torch.Tensor, lr: float, weight_decay: float = 0.0):
+        input_ids = self.input_cache
+        grad_flat = grad_output.view(-1, self.embedding_dim)
+        ids_flat = input_ids.view(-1)
+        
+        unique_ids, inverse_indices = torch.unique(ids_flat, return_inverse=True)
+        grad_sum = torch.zeros(len(unique_ids), self.embedding_dim, 
+                             dtype=grad_flat.dtype, device=grad_flat.device)
+        grad_sum.index_add_(0, inverse_indices, grad_flat)
+        
+        with torch.no_grad():
+            current_weights = self.weight.data[unique_ids]
+            current_energy = self.weight_energy[unique_ids]
             
-            # 2. [新增] 稀疏梯度裁剪
-            # 计算每个样本产生的梯度模长
-            grad_norm = torch.abs(grad_flat)
-            # 限制模长
-            clip_scale = torch.clamp(5.0 / (grad_norm + 1e-6), max=1.0)
-            clipped_grad = grad_flat * clip_scale
+            curr_grad_sq = grad_sum.abs().pow(2)
             
-            # 3. 应用更新
-            # 实部虚部分开 add
-            total_delta = clipped_grad + decay_delta
+            # [FIX 2] 0.99 -> 0.90
+            beta = 0.90
+            eps = 1e-5
+            current_energy.mul_(beta).add_(curr_grad_sq, alpha=1-beta)
             
-            self.weight.real.index_add_(0, indices_flat, learning_rate * total_delta.real)
-            self.weight.imag.index_add_(0, indices_flat, learning_rate * total_delta.imag)
+            denom = current_energy.sqrt().add_(eps)
+            adaptive_step = grad_sum / denom * lr
             
-        self.clear_cache()
+            current_weights.sub_(adaptive_step)
+            
+            norm = current_weights.abs() + 1e-9
+            projected_weights = current_weights / norm
+            
+            self.weight.data[unique_ids] = projected_weights
+            self.weight_energy[unique_ids] = current_energy
+            
         return None

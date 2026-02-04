@@ -1,108 +1,85 @@
 import torch
 import torch.nn as nn
-import numpy as np
 from Anla.core.base_layer import ComplexLayer
+from Anla.utils.complex_ops import complex_kaiming_normal_
 
 class ComplexLinear(ComplexLayer):
     """
-    全复数线性层 (Fully Complex Linear Layer)
-    支持 2D (Batch, Dim) 和 3D (Batch, Seq, Dim) 输入。
+    [GPU Ready + High Viscosity]
+    Fix: Increase rest mass and responsiveness to prevent warmup shock.
     """
-    
-    def __init__(self, in_features: int, out_features: int, bias: bool = True):
+    def __init__(self, in_features, out_features, bias=True, mode='descent'):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
+        self.mode = mode
         
-        # 权重初始化
-        self.weight = nn.Parameter(torch.randn(out_features, in_features, dtype=torch.complex64))
+        weight_real = torch.empty(out_features, in_features)
+        weight_imag = torch.empty(out_features, in_features)
+        complex_kaiming_normal_(weight_real, weight_imag)
+        self.weight = nn.Parameter(torch.complex(weight_real, weight_imag))
         
         if bias:
             self.bias = nn.Parameter(torch.zeros(out_features, dtype=torch.complex64))
         else:
             self.register_parameter('bias', None)
             
-        self.reset_parameters()
+        # [FIX 1] 增加静止质量：1e-5 -> 1e-3
+        # 提供更强的初始阻尼
+        self.register_buffer('weight_energy', torch.full((out_features, in_features), 1e-3, dtype=torch.float32))
+        
+        if bias:
+            self.register_buffer('bias_energy', torch.full((out_features,), 1e-3, dtype=torch.float32))
+        else:
+            self.bias_energy = None
 
-    def reset_parameters(self):
-        scale = np.sqrt(1 / (self.in_features + self.out_features))
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        self.input_cache = x if self.training else None
         with torch.no_grad():
-            nn.init.uniform_(self.weight.real, -scale, scale)
-            nn.init.uniform_(self.weight.imag, -scale, scale)
-            if self.bias is not None:
-                nn.init.constant_(self.bias, 0)
+            return nn.functional.linear(x, self.weight, self.bias)
 
-    def forward(self, input_z: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            input_z: (Batch, ..., in_features)
-        """
-        self.input_cache = input_z.detach().clone()
+    def manual_backward(self, grad_output: torch.Tensor, learning_rate: float, weight_decay: float = 0.0) -> torch.Tensor:
+        x = self.input_cache
+        grad_input = grad_output @ self.weight.conj()
         
-        # PyTorch 的 linear 实现是 input @ weight.T
-        # 它自动支持多维输入 (Batch, Seq, In) -> (Batch, Seq, Out)
-        output = torch.matmul(input_z, self.weight.t())
-        
-        if self.bias is not None:
-            output += self.bias
-            
-        return output
-
-    def manual_backward(self, grad_output: torch.Tensor, learning_rate: float, weight_decay: float = 1e-4) -> torch.Tensor:
-        """
-        [修正版] 支持任意维度输入的反向传播 (2D or 3D)
-        """
-        if self.input_cache is None:
-            raise RuntimeError("Forward pass must be called before manual_backward.")
-            
-        X = self.input_cache        # (Batch, ..., In)
-        delta_Y = grad_output       # (Batch, ..., Out)
-        
-        # --- 1. Error Backpropagation (梯度回传) ---
-        # Formula: grad_in = grad_out @ W*
-        # PyTorch matmul 自动处理最后两维，所以 3D 输入也能直接乘
-        # (..., Out) @ (Out, In) -> (..., In)
-        grad_input = torch.matmul(delta_Y, self.weight.conj())
-        
-        # --- 2. Weight Gradient Calculation (dW) ---
-        # Formula: dW = delta_Y^T @ X*
-        # 但我们需要处理 Batch 和 Sequence 维度。
-        # 最简单的方法：将前导维度展平 (Flatten batch & seq)
-        
-        # 将 X 和 delta_Y 展平为 2D: (N_samples, Features)
-        X_flat = X.reshape(-1, self.in_features)
-        delta_flat = delta_Y.reshape(-1, self.out_features)
-        
-        # 计算有效样本数 (Batch * Seq)
-        total_samples = X_flat.shape[0]
-        
-        # 现在可以使用 .t() 了
-        # (Out, N) @ (N, In) -> (Out, In)
-        dW = torch.matmul(delta_flat.t(), X_flat.conj()) / total_samples
-        
-        # Bias Gradient
-        if self.bias is not None:
-            # 对所有样本维度求和
-            dB = torch.sum(delta_flat, dim=0) / total_samples
+        if x.dim() > 2:
+            x_flat = x.reshape(-1, x.shape[-1])
+            grad_flat = grad_output.reshape(-1, grad_output.shape[-1])
         else:
-            dB = None
+            x_flat = x
+            grad_flat = grad_output
             
-        # --- 3. Update Parameters ---
-        # 使用基类的 _apply_gradient (如果基类已更新)
-        # 如果尚未更新基类，这里直接写更新逻辑
-        if hasattr(self, '_apply_gradient'):
-            self._apply_gradient(self.weight, dW, learning_rate, decay=weight_decay, clip_norm=5.0)
+        d_weight = grad_flat.mT @ x_flat.conj()
+        
+        with torch.no_grad():
+            scale = 1.0 / x_flat.shape[0]
+            
+            # [FIX 2] 降低惯性：0.99 -> 0.90
+            # 让阻力更快地随梯度增大而增大，防止滞后爆炸
+            beta = 0.90 
+            eps = 1e-5
+            
+            curr_grad_mag_sq = (d_weight * scale).abs().pow(2)
+            self.weight_energy.mul_(beta).add_(curr_grad_mag_sq, alpha=1-beta)
+            
+            denom = self.weight_energy.sqrt().add_(eps)
+            adaptive_step = (d_weight * scale) / denom * learning_rate
+            
             if self.bias is not None:
-                self._apply_gradient(self.bias, dB, learning_rate, decay=0.0, clip_norm=5.0)
-        else:
-            # Fallback (如果你没有更新 base_layer.py)
-            with torch.no_grad():
-                # Decay
+                d_bias = grad_flat.sum(dim=0)
+                curr_bias_mag_sq = (d_bias * scale).abs().pow(2)
+                self.bias_energy.mul_(beta).add_(curr_bias_mag_sq, alpha=1-beta)
+                denom_b = self.bias_energy.sqrt().add_(eps)
+                adaptive_step_b = (d_bias * scale) / denom_b * learning_rate
+            
+            if weight_decay > 0:
                 self.weight.data.mul_(1.0 - weight_decay)
-                # Update
-                self.weight.data.add_(dW, alpha=learning_rate)
-                if self.bias is not None:
-                    self.bias.data.add_(dB, alpha=learning_rate)
                 
-        self.clear_cache()
+            if self.mode == 'hebbian':
+                self.weight.data.add_(adaptive_step)
+                if self.bias is not None: self.bias.data.add_(adaptive_step_b)
+            elif self.mode == 'descent':
+                self.weight.data.sub_(adaptive_step)
+                if self.bias is not None: self.bias.data.sub_(adaptive_step_b)
+
         return grad_input

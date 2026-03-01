@@ -23,22 +23,26 @@
 反向传播: 严格 Wirtinger 微积分
 =========================================================================
 
-本实现修正了原版 PhaseTwist 中的两处数学错误:
+修正说明 (相对于原版):
 
-错误 1 — 输入梯度的共轭方向:
-    原版:  grad_input = conj(df/dz)·G + conj(df/dz*)·conj(G)
-    正确:  grad_input = conj(df/dz)·G + (df/dz*)·conj(G)
-    
-    推导依据 (Wirtinger 链式法则):
-        dL/dz* = (dL/df)·(df/dz*) + (dL/df*)·(df*/dz*)
-        其中 dL/df = conj(G),  df*/dz* = conj(df/dz)
-        => dL/dz* = conj(G)·(df/dz*) + G·conj(df/dz)
+Fix 1 — epsilon 统一:
+    原版前向使用 eps=1e-8, 反向使用 eps=1e-9, 导致 r 估计不一致。
+    当 |z| 极小时, 1/r 项因此产生约 10x 的放大差异。
+    → 修正: 统一为类常量 EPS = 1e-7 (在 float32 下提供足够的保护范围)。
 
-错误 2 — 参数更新方向:
-    原版:  param += lr * Re(G · conj(df/dp))   (梯度上升!)
-    正确:  param -= lr * Re(G · conj(df/dp))   (梯度下降)
-    
-    推导: dL/dp = 2·Re(G · conj(df/dp)),  下降方向为 p -= η·(dL/dp)
+Fix 2 — 小模长区域数值稳定性:
+    Wirtinger 变换中出现 1/r 除法: df_dz = ... + df_dtheta · (-0.5j/r) · e^{-iθ}
+    当 r → 0 时, 即使有 eps 保护, 1/r 仍会将 df_dtheta 中的
+    float32 舍入噪声放大到不可控的程度。
+    → 修正: 引入 safe_inv_r = 1/max(r, EPS_SAFE), 其中 EPS_SAFE = 1e-4,
+      在极小模长区域截断 1/r 的增长, 代价是丧失该区域的切向分辨率
+      (但该区域信号本身已无物理意义)。
+
+Fix 3 — 参数梯度常数因子 2:
+    原版注释 "常数 2 由学习率吸收", 但 ComplexLinear 使用完整的
+    Wirtinger 梯度 (无缺失因子)。这导致 γ/β/φ 的有效学习率
+    是权重矩阵的 1/2, 引入层间学习率不均匀。
+    → 修正: 显式乘以 2, 使梯度量纲与 ComplexLinear 一致。
 """
 
 import torch
@@ -46,16 +50,26 @@ import torch.nn as nn
 from Anla.core.base_layer import ComplexLayer
 
 
+# ========== 统一的数值常量 ==========
+# EPS: 加在模长上防止 angle(z) 在零点附近不稳定
+EPS = 1e-7
+
+# EPS_SAFE: 1/r 除法的安全下界
+# 当 |z| < EPS_SAFE 时, 切向分辨率被截断 (信号太弱, 不值得精确追踪相位)
+EPS_SAFE = 1e-4
+
+
 class PhaseTwist(ComplexLayer):
     """
     双向耦合复数激活函数。
 
-    接口与原版 PhaseTwist 完全兼容:
+    接口:
         forward(z) -> z_out
         manual_backward(grad_output, learning_rate, **kwargs) -> grad_input
 
-    新增参数:
-        beta  — AM←PM 耦合强度 (init=0.01, 足够小以保证训练初期稳定)
+    可学习参数:
+        gamma — PM→AM 耦合系数 (init=0.01)
+        beta  — AM←PM 耦合强度 (init=0.01)
         phi   — AM←PM 参考相位 (init=0.0)
     """
 
@@ -91,12 +105,21 @@ class PhaseTwist(ComplexLayer):
     #  前向传播
     # ==================================================================
     def forward(self, z: torch.Tensor) -> torch.Tensor:
+        """
+        前向: z → tanh(r·(1+β·cos(θ-φ))) · e^{i(θ+γ·r)}
+
+        Args:
+            z: 复数输入张量, shape (..., channels)
+
+        Returns:
+            复数输出张量, shape 同输入
+        """
         # 缓存输入供反向使用（训练态）
         self.input_cache = z.detach().clone() if self.training else None
 
-        eps = 1e-8
-        r = torch.abs(z) + eps           # 模长  (Batch, ..., Ch)
-        theta = torch.angle(z)           # 相位
+        # [Fix 1] 统一使用 EPS
+        r = torch.abs(z) + EPS       # 模长  (Batch, ..., Ch)
+        theta = torch.angle(z)       # 相位
 
         # 广播参数
         gamma = self._broadcast(self.gamma, z.dim())
@@ -125,14 +148,21 @@ class PhaseTwist(ComplexLayer):
         接收上游传来的复数误差向量 G = dL/df*,
         计算并返回 dL/dz* (传给前层),
         同时原地更新 gamma, beta, phi (梯度下降).
+
+        Args:
+            grad_output: G = dL/df*, shape 同输入 z
+            learning_rate: 学习率
+
+        Returns:
+            dL/dz*, shape 同输入 z
         """
         z = self.input_cache
         if z is None:
             # 非训练态, 直接透传
             return grad_output
 
-        eps = 1e-9
-        r = torch.abs(z) + eps
+        # [Fix 1] 统一使用 EPS (与前向一致)
+        r = torch.abs(z) + EPS
         theta = torch.angle(z)
 
         # 广播参数
@@ -160,8 +190,7 @@ class PhaseTwist(ComplexLayer):
         #    f = tanh(m) · e^{iθ_out}
         #    dm/dr = 1 + β·cos(θ-φ)
         #    dθ_out/dr = γ
-        #    df/dr = [d(tanh(m))/dr] · e^{iθ_out}  +  tanh(m) · [d(e^{iθ_out})/dr]
-        #          = sech²(m)·(dm/dr)·e^{iθ_out}   +  tanh(m)·iγ·e^{iθ_out}
+        #    df/dr = sech²(m)·(dm/dr)·e^{iθ_out} + tanh(m)·iγ·e^{iθ_out}
         #          = sech²(m)·(1+β·cos(θ-φ))·e^{iθ_out} + iγ·f
         #
         df_dr = sech2_m * (1.0 + beta * cos_diff) * e_i_tout + 1j * gamma * f
@@ -171,7 +200,7 @@ class PhaseTwist(ComplexLayer):
         #  推导:
         #    dm/dθ = r · β · (-sin(θ-φ))
         #    dθ_out/dθ = 1
-        #    df/dθ = sech²(m)·(dm/dθ)·e^{iθ_out}  +  tanh(m)·i·e^{iθ_out}
+        #    df/dθ = sech²(m)·(dm/dθ)·e^{iθ_out} + tanh(m)·i·e^{iθ_out}
         #          = -sech²(m)·r·β·sin(θ-φ)·e^{iθ_out} + i·f
         #
         df_dtheta = -sech2_m * r * beta * sin_diff * e_i_tout + 1j * f
@@ -187,16 +216,20 @@ class PhaseTwist(ComplexLayer):
         z_hat = z / r       # e^{iθ}  (归一化方向)
         z_hat_c = z_hat.conj()  # e^{-iθ}
 
+        # [Fix 2] 安全的 1/r 计算
+        # 当 r 极小时, 截断 1/r 的增长，防止切向项爆炸
+        safe_inv_r = 1.0 / torch.clamp(r, min=EPS_SAFE)
+
         #  df/dz  = df/dr · dr/dz  + df/dθ · dθ/dz
         #         = df/dr · (1/2)·e^{-iθ}  +  df/dθ · (-i/(2r))·e^{-iθ}
-        df_dz = df_dr * (0.5 * z_hat_c) + df_dtheta * (-0.5j / r * z_hat_c)
+        df_dz = df_dr * (0.5 * z_hat_c) + df_dtheta * (-0.5j * safe_inv_r * z_hat_c)
 
         #  df/dz* = df/dr · dr/dz* + df/dθ · dθ/dz*
         #         = df/dr · (1/2)·e^{iθ}  +  df/dθ · (i/(2r))·e^{iθ}
-        df_dz_conj = df_dr * (0.5 * z_hat) + df_dtheta * (0.5j / r * z_hat)
+        df_dz_conj = df_dr * (0.5 * z_hat) + df_dtheta * (0.5j * safe_inv_r * z_hat)
 
         # =============================================================
-        #  Step 3: 输入梯度 (修正后的 Wirtinger 链式法则)
+        #  Step 3: 输入梯度 (Wirtinger 链式法则)
         # =============================================================
         #
         #  dL/dz* = (dL/df) · (df/dz*)  +  (dL/df*) · (df*/dz*)
@@ -220,23 +253,24 @@ class PhaseTwist(ComplexLayer):
         #          = conj(G)·(df/dp) + G·conj(df/dp)
         #          = 2·Re( G · conj(df/dp) )
         #
-        #  实现中计算 Re(G · conj(df/dp))，常数 2 由学习率吸收。
+        #  [Fix 3] 显式计算完整梯度 2·Re(...)，
+        #  不再静默吸收常数因子，与 ComplexLinear 的梯度量纲一致。
         #
 
         # (a) γ 梯度:  df/dγ = i · f · r
         #     (增大 γ → 输出相位多旋转 → f 在复平面上转动)
         df_dgamma = 1j * f * r
-        d_gamma_elem = torch.real(grad_output * torch.conj(df_dgamma))
+        d_gamma_elem = 2.0 * torch.real(grad_output * torch.conj(df_dgamma))
 
         # (b) β 梯度:  df/dβ = sech²(m) · r · cos(θ-φ) · e^{iθ_out}
         #     (增大 β → 相位-模长耦合更强 → 模长响应随相位振荡更剧烈)
         df_dbeta = sech2_m * r * cos_diff * e_i_tout
-        d_beta_elem = torch.real(grad_output * torch.conj(df_dbeta))
+        d_beta_elem = 2.0 * torch.real(grad_output * torch.conj(df_dbeta))
 
         # (c) φ 梯度:  df/dφ = sech²(m) · r · β · sin(θ-φ) · e^{iθ_out}
         #     (增大 φ → 参考相位旋转 → 改变哪些方向被增强/衰减)
         df_dphi = sech2_m * r * beta * sin_diff * e_i_tout
-        d_phi_elem = torch.real(grad_output * torch.conj(df_dphi))
+        d_phi_elem = 2.0 * torch.real(grad_output * torch.conj(df_dphi))
 
         # =============================================================
         #  Step 5: 聚合 & 更新参数
@@ -249,11 +283,10 @@ class PhaseTwist(ComplexLayer):
         d_phi = d_phi_elem.reshape(-1, self.channels).sum(dim=0) / total_samples
 
         with torch.no_grad():
-            # ★ 梯度下降 (原版使用 += 是梯度上升，此处修正为 -=)
+            # 梯度下降: p -= η · (dL/dp)
             self.gamma.data -= learning_rate * d_gamma
             self.beta.data -= learning_rate * d_beta
             self.phi.data -= learning_rate * d_phi
 
         self.clear_cache()
         return grad_input
-

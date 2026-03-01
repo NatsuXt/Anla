@@ -13,13 +13,18 @@
     没有它, Hebbian 网络会因能量正反馈瞬间发散。
     scale 参数类似探测器增益, 允许各层自适应调节信号强度。
 
-修正说明:
-    原版 scale 更新使用 `scale += lr * grad`, 这是梯度上升。
-    物理上, 当 grad > 0 意味着"增大 scale 会增大 loss", 
-    应该减小 scale, 即使用 `scale -= lr * grad` (梯度下降)。
-    
-    此修正与 activation.py 中的参数更新方向修正一致,
-    确保整条反向传播链上所有可学习参数的更新方向统一为梯度下降。
+修正说明 (相对于原版):
+
+Fix 1 — scale 梯度的常数因子 2:
+    原版注释 "常数 2 由学习率吸收"。
+    但 ComplexLinear 通过 Wirtinger 梯度 dL/dW* = G^T @ X* 
+    获得的是完整梯度 (无缺失因子, 因为 Y 关于 W 全纯)。
+    而 scale 是实参数, 其完整梯度为 dL/dp = 2·Re(G · conj(df/dp))。
+    原版只计算了 Re(...)，导致 scale 的有效学习率是 ComplexLinear
+    权重的 1/2，引入层间学习率不均匀。
+    → 修正: 显式乘以 2。
+
+    注: 输入梯度 dL/dz* 的公式不受此影响 (已经是完整的 Wirtinger 表达式)。
 """
 
 import torch
@@ -42,6 +47,15 @@ class ComplexRMSNorm(ComplexLayer):
         self.scale = nn.Parameter(torch.ones(normalized_shape, dtype=torch.float32))
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
+        """
+        前向传播: z → z/rms · scale
+
+        Args:
+            z: 复数输入张量, shape (..., normalized_shape)
+
+        Returns:
+            归一化后的复数张量, shape 同输入
+        """
         self.input_cache = z.detach().clone()
 
         # 1. 计算 RMS (Root Mean Square of magnitudes)
@@ -62,24 +76,45 @@ class ComplexRMSNorm(ComplexLayer):
                         learning_rate: float, **kwargs) -> torch.Tensor:
         """
         手动反向传播, 支持任意维度输入。
-        
+
         G = grad_output = dL/d(output)*
         返回 dL/dz* (传给前层)
+
+        推导 — scale 梯度:
+            output = z_norm · scale    (scale 是实参数)
+            dL/d(scale) = 2·Re( G · conj(z_norm) )
+
+        推导 — 输入梯度:
+            z_norm_d = z_d / rms
+            rms² = (1/D) Σ_d |z_d|² + ε
+
+            通过 Wirtinger 微积分:
+            ∂z_norm_d/∂z_j* = -z_norm_d · z_norm_j / (2D · rms)
+            ∂z_norm_d/∂z_j  = δ_{dj}/rms - z_norm_d · conj(z_norm_j) / (2D · rms)
+
+            dL/dz_j* = Σ_d [ conj(G_y_d) · ∂z_norm_d/∂z_j* + G_y_d · conj(∂z_norm_d/∂z_j) ]
+            
+            其中 G_y = G · scale (穿过 scale 层的梯度)
+
+            展开后化简:
+            dL/dz_j* = [ G_y_j - z_norm_j · Re(Σ_d G_y_d · conj(z_norm_d)) / D ] / rms
+
+            注: Wirtinger 的 1/2 因子与 2·Re(...) 的 2 抵消,
+                输入梯度公式中没有多余的常数因子。
         """
         z = self.input_cache
         z_normalized, rms = self.output_cache
 
         # ----- 1. scale 的梯度 -----
         #
-        # output = z_norm · scale
-        # d(output)/d(scale) = z_norm   (scale 是实数, 所以没有共轭歧义)
+        # output = z_norm · scale   (scale 是实数)
+        # d(output)/d(scale) = z_norm
         #
-        # dL/d(scale) = 2·Re( G · conj(d(output)/d(scale)) )
-        #             = 2·Re( G · conj(z_norm) )
+        # dL/d(scale) = 2·Re( G · conj(z_norm) )
         #
-        # 实现中计算 Re(G · conj(z_norm)), 常数 2 由学习率吸收。
+        # [Fix 1] 显式乘以 2，不再让学习率静默吸收
         #
-        grad_scale_per_element = torch.real(grad_output * torch.conj(z_normalized))
+        grad_scale_per_element = 2.0 * torch.real(grad_output * torch.conj(z_normalized))
 
         # 展平: 无论 2D 还是 3D, 统一为 (TotalSamples, Dim)
         grad_scale_flat = grad_scale_per_element.view(-1, self.normalized_shape)
@@ -87,15 +122,17 @@ class ComplexRMSNorm(ComplexLayer):
         grad_scale = torch.sum(grad_scale_flat, dim=0) / total_samples
 
         with torch.no_grad():
-            # ★ 梯度下降 (修正: 原版使用 += 是梯度上升)
+            # 梯度下降: scale -= η · (dL/d_scale)
             self.scale.data -= learning_rate * grad_scale
 
         # ----- 2. 输入 z 的梯度 -----
         #
-        # 采用高效 RMSNorm Jacobian 结构:
-        #   dL/dz* = scale · [ G_y - z_norm · Re( sum_j G_y_j · conj(z_norm_j) ) / dim ] / rms
+        # 高效 RMSNorm Jacobian 结构:
+        #   dL/dz* = [ G_y - z_norm · Re(Σ_j G_y_j · conj(z_norm_j)) / D ] / rms
         #
-        # 其中 G_y = G · scale  (穿过 scale 层的梯度)
+        # 其中 G_y = G · scale (穿过 scale 层后的梯度)
+        #
+        # 注: 此公式已是完整的 Wirtinger 表达式, 无缺失因子。
         #
         grad_y = grad_output * self.scale
 
@@ -109,4 +146,3 @@ class ComplexRMSNorm(ComplexLayer):
 
         self.clear_cache()
         return grad_input
-

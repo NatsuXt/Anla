@@ -7,6 +7,8 @@ class ComplexLinear(ComplexLayer):
     """
     [GPU Ready + High Viscosity]
     Fix: Increase rest mass and responsiveness to prevent warmup shock.
+
+    v2 变更: input_cache 使用 detach().clone() 防止上游原地修改污染缓存。
     """
     def __init__(self, in_features, out_features, bias=True, mode='descent'):
         super().__init__()
@@ -25,7 +27,6 @@ class ComplexLinear(ComplexLayer):
             self.register_parameter('bias', None)
             
         # [FIX 1] 增加静止质量：1e-5 -> 1e-3
-        # 提供更强的初始阻尼
         self.register_buffer('weight_energy', torch.full((out_features, in_features), 1e-3, dtype=torch.float32))
         
         if bias:
@@ -34,7 +35,8 @@ class ComplexLinear(ComplexLayer):
             self.bias_energy = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        self.input_cache = x if self.training else None
+        # [v2] 安全缓存: detach().clone() 防止上游原地修改污染
+        self.input_cache = x.detach().clone() if self.training else None
         with torch.no_grad():
             return nn.functional.linear(x, self.weight, self.bias)
 
@@ -55,7 +57,6 @@ class ComplexLinear(ComplexLayer):
             scale = 1.0 / x_flat.shape[0]
             
             # [FIX 2] 降低惯性：0.99 -> 0.90
-            # 让阻力更快地随梯度增大而增大，防止滞后爆炸
             beta = 0.90 
             eps = 1e-5
             

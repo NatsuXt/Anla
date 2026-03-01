@@ -82,6 +82,9 @@ CONFIG = {
     'weight_decay': 1e-4,      # 权重衰减 (能量耗散)
     'epochs': 5000,
 
+    # [v2] 反作用力参数: target 侧学习率 = lr * reaction_scale
+    'reaction_scale': 0.1,
+
     # --- 输出 ---
     'save_dir': 'checkpoints',
     'log_interval': 100,       # 每隔多少 epoch 打印一次日志
@@ -365,6 +368,20 @@ def train_ring_inpainting():
 
         # 5. 手动反向传播 (复数力向量直接传入, 无缝合)
         model.manual_backward(force, CONFIG['lr'], CONFIG['weight_decay'])
+
+        # 6. [v2] Path B: Target 侧 embedding 更新 (双向纠缠)
+        #    让 target embedding 也向 prediction 方向微弱移动,
+        #    防止高 vocab 下 target embedding 成为静态"死区"。
+        reaction_lr = CONFIG['lr'] * CONFIG['reaction_scale']
+        if reaction_lr > 0 and valid_mask.any():
+            valid_target_ids = target_ids[valid_mask]
+            valid_reaction = -force[valid_mask]
+            model.embedding.manual_backward_explicit(
+                grad=valid_reaction,
+                indices=valid_target_ids,
+                lr=reaction_lr,
+                weight_decay=CONFIG['weight_decay'],
+            )
 
         # ----- 日志与评估 -----
         if epoch % CONFIG['log_interval'] == 0:

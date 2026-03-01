@@ -162,8 +162,9 @@ class MagPhaseSoftmax(ComplexLayer):
         scale = self.scale_factor        # 缩放因子
         S = self.input_cache             # 原始复数输入 S
 
-        eps = 1e-9
-        mag_S = torch.abs(S) + eps       # |S_k|, 加 eps 防止除零
+        # [v2] eps: 1e-9 → 1e-4, 防止训练初期 Q⊥K 时 1/|S| 爆炸
+        eps = 1e-4
+        mag_S = torch.abs(S) + eps       # |S_k|, 安全下界防止除零
 
         # ---- Step 1: 构造单位相位向量 e_k = e^{iθ_k} ----
         e = torch.polar(torch.ones_like(phase), phase)

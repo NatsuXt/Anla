@@ -64,9 +64,10 @@ EXPERIMENT_CONFIGS = {
         "max_span_length": 5,
         "batch_size": 16,
         "lr": 0.001,
-        "weight_decay": 1e-4,
+        "base_weight_decay": 1e-4,   # [v2] 基准值, 按 d_model 缩放
         "epochs": 5000,
         "holdout_frac": 0.2,
+        "reaction_scale": 0.1,        # [v2] target 侧更新缩放
     },
     "B": {
         "name": "B_v256_d64",
@@ -77,9 +78,10 @@ EXPERIMENT_CONFIGS = {
         "max_span_length": 5,
         "batch_size": 32,
         "lr": 0.001,
-        "weight_decay": 1e-4,
+        "base_weight_decay": 1e-4,
         "epochs": 10000,
         "holdout_frac": 0.2,
+        "reaction_scale": 0.1,
     },
     "C": {
         "name": "C_v512_d32",
@@ -90,9 +92,10 @@ EXPERIMENT_CONFIGS = {
         "max_span_length": 5,
         "batch_size": 32,
         "lr": 0.001,
-        "weight_decay": 1e-4,
+        "base_weight_decay": 1e-4,
         "epochs": 15000,
         "holdout_frac": 0.2,
+        "reaction_scale": 0.1,
     },
     "D": {
         "name": "D_v1024_d32",
@@ -103,9 +106,10 @@ EXPERIMENT_CONFIGS = {
         "max_span_length": 5,
         "batch_size": 64,
         "lr": 0.001,
-        "weight_decay": 1e-4,
+        "base_weight_decay": 1e-4,
         "epochs": 20000,
         "holdout_frac": 0.2,
+        "reaction_scale": 0.1,
     },
     "E": {
         "name": "E_v1024_d16",
@@ -116,11 +120,49 @@ EXPERIMENT_CONFIGS = {
         "max_span_length": 5,
         "batch_size": 64,
         "lr": 0.001,
-        "weight_decay": 1e-4,
+        "base_weight_decay": 1e-4,
         "epochs": 20000,
         "holdout_frac": 0.2,
+        "reaction_scale": 0.1,
     },
 }
+
+
+# =====================================================================
+#  [v2] Weight Decay 缩放
+# =====================================================================
+def compute_effective_weight_decay(cfg: Dict) -> float:
+    """按 d_model 缩放 weight_decay: wd = base_wd * (d_model / 64)"""
+    return cfg["base_weight_decay"] * (cfg["d_model"] / 64.0)
+
+
+# =====================================================================
+#  [v2] 平滑 Loss 追踪器
+# =====================================================================
+class SmoothedLossTracker:
+    """基于 EMA 的 Loss 追踪, 用于替代高方差准确率做早停判断。"""
+    def __init__(self, ema_beta: float = 0.9):
+        self.ema_beta = ema_beta
+        self.smoothed_loss = None
+        self.best_smoothed_loss = float("inf")
+        self.steps_without_improvement = 0
+
+    def update(self, loss: float, interval: int = 1) -> bool:
+        if self.smoothed_loss is None:
+            self.smoothed_loss = loss
+        else:
+            self.smoothed_loss = self.ema_beta * self.smoothed_loss + (1.0 - self.ema_beta) * loss
+        improved = False
+        if self.smoothed_loss < self.best_smoothed_loss - 1e-8:
+            self.best_smoothed_loss = self.smoothed_loss
+            self.steps_without_improvement = 0
+            improved = True
+        else:
+            self.steps_without_improvement += interval
+        return improved
+
+    def patience_exceeded(self, patience: int) -> bool:
+        return self.steps_without_improvement >= patience
 
 
 # =====================================================================
@@ -482,9 +524,12 @@ def train_single_config(
     max_span = cfg["max_span_length"]
     batch_size = cfg["batch_size"]
     lr = cfg["lr"]
-    wd = cfg["weight_decay"]
     epochs = cfg["epochs"]
     mask_id = vocab_size  # MASK token = vocab_size
+    reaction_scale = cfg.get("reaction_scale", 0.1)  # [v2]
+
+    # [v2] 按 d_model 缩放 weight_decay
+    wd = compute_effective_weight_decay(cfg)
 
     ratio = vocab_size / d_model
 
@@ -493,7 +538,8 @@ def train_single_config(
     print(f"  Config: {cfg['name']}")
     print(f"  vocab_size={vocab_size}, d_model={d_model}, "
           f"ratio={ratio:.0f}:1, num_heads={num_heads}")
-    print(f"  epochs={epochs}, batch_size={batch_size}, lr={lr}")
+    print(f"  epochs={epochs}, batch_size={batch_size}, lr={lr}, "
+          f"wd={wd:.2e} (scaled), reaction={reaction_scale}")
     print("=" * 72)
 
     # ---- 数据生成器 ----
@@ -526,6 +572,9 @@ def train_single_config(
     epochs_without_improvement = 0
     last_best_epoch = 0
 
+    # [v2] 平滑 Loss 追踪 (用于早停)
+    loss_tracker = SmoothedLossTracker(ema_beta=0.9)
+
     t_start = time.time()
 
     # ---- 训练循环 ----
@@ -551,6 +600,18 @@ def train_single_config(
 
         # 反向传播
         model.manual_backward(force, lr, wd)
+
+        # [v2] Path B: Target 侧 embedding 更新
+        reaction_lr = lr * reaction_scale
+        if reaction_lr > 0 and valid_mask.any():
+            valid_target_ids = target_ids[valid_mask]
+            valid_reaction = -force[valid_mask]
+            model.embedding.manual_backward_explicit(
+                grad=valid_reaction,
+                indices=valid_target_ids,
+                lr=reaction_lr,
+                weight_decay=wd,
+            )
 
         # ---- 评估 ----
         if epoch % log_interval == 0:
@@ -606,10 +667,14 @@ def train_single_config(
             if test_acc > best_test_acc:
                 best_test_acc = test_acc
 
-            # Early stopping
-            if epochs_without_improvement >= patience and best_train_acc > 0.5:
-                print(f"  [Early Stop] 已 {epochs_without_improvement} epochs "
-                      f"无提升, 在 epoch {epoch} 停止 (best @ {last_best_epoch})")
+            # [v2] 早停: 基于 smoothed loss 趋势 (替代高方差准确率)
+            loss_tracker.update(loss_val, interval=log_interval)
+
+            if loss_tracker.patience_exceeded(patience) and best_train_acc > 0.3:
+                print(f"  [Early Stop] Smoothed loss 已 "
+                      f"{loss_tracker.steps_without_improvement} epochs "
+                      f"无改善, 在 epoch {epoch} 停止 "
+                      f"(best acc @ {last_best_epoch})")
                 break
 
             model.train()
@@ -652,6 +717,7 @@ def train_single_config(
     # ---- 汇总结果 ----
     result = {
         "config": cfg,
+        "effective_weight_decay": wd,
         "vocab_d_ratio": ratio,
         "total_params": total_params,
         "training_time_sec": round(t_elapsed, 1),
@@ -685,6 +751,7 @@ def train_single_config(
         print(f"    TDA H1 count: {tda['h1_count']}")
         print(f"    TDA dominant: {tda['dominant_persistence']:.4f}")
         print(f"    TDA ratio: {tda['dominance_ratio']:.4f}")
+    print(f"    Weight Decay (effective): {wd:.2e}")
     print(f"    用时: {t_elapsed:.0f}s")
     print()
 

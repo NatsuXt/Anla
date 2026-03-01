@@ -40,6 +40,18 @@ Anla Ring Inpainting — 流形修复训练脚本 (Manifold Repair)
 评估方式:
     最近邻匹配 — 将 z_pred 与 embedding 表中所有 token 原型做距离比较,
     取最近的作为预测。不依赖投影头或 softmax。
+
+v3 变更:
+    [v3-1] Path B (target 侧更新) 使用 ρ(t) 软缩放:
+        ρ(t) = clamp((L₀ - L(t)) / L₀, 0, 1)
+        η_reaction = η · α · ρ(t)
+        
+        物理含义: ρ(t) 度量 Transformer 从上下文提取信息的能力。
+        训练初期 ρ≈0, Path B 几乎不起作用 (prediction 不可靠);
+        训练后期 ρ→1, Path B 以全力缩放运行 (prediction 可信)。
+
+    [v3-2] 删除 Embedding RMS 稳态 (见 embedding.py v3),
+           新增 embedding_rms 监控指标。
 """
 
 import torch
@@ -82,7 +94,8 @@ CONFIG = {
     'weight_decay': 1e-4,      # 权重衰减 (能量耗散)
     'epochs': 5000,
 
-    # [v2] 反作用力参数: target 侧学习率 = lr * reaction_scale
+    # [v3] Path B 反作用力参数
+    # target 侧有效学习率 = lr * reaction_scale * ρ(t)
     'reaction_scale': 0.1,
 
     # --- 输出 ---
@@ -175,7 +188,12 @@ class AnlaManifoldInpainter(nn.Module):
         # 逆序穿过各层
         grad = self.block.manual_backward(force, lr, wd)
         grad = self.rotary.manual_backward(grad)
-        self.embedding.manual_backward(grad, lr, wd)
+        # [v3] Embedding 层不施加 weight decay:
+        # L_Elegant 是尺度不变的 (度量 ln(r/r̂) 比值),
+        # 无法感知全局模长缩放, 因此无力抵抗 weight decay 的无条件收缩,
+        # 导致 EmbRMS 单调跌落至零。
+        # Transformer 内部层的 weight decay 保留 (它们有足够的梯度对抗收缩)。
+        self.embedding.manual_backward(grad, lr, weight_decay=0.0)
 
 
 # =====================================================================
@@ -336,6 +354,24 @@ def train_ring_inpainting():
     best_acc = 0.0
     best_loss = float('inf')
 
+    # ----- [v3] ρ(t) 学习进度追踪 -----
+    #
+    # ρ(t) = clamp((L₀ - L(t)) / L₀, 0, 1)
+    #
+    # L₀: 初始 loss (前 N 步的 EMA 均值)
+    # L(t): 当前 smoothed loss
+    #
+    # 用途: 控制 Path B (target 侧更新) 的有效学习率
+    #   η_reaction = η · reaction_scale · ρ(t)
+    #
+    # 物理含义: ρ(t) 度量 Transformer 从上下文提取信息的能力
+    #   ρ ≈ 0 → 模型未学到东西, prediction 不可靠, Path B 几乎关闭
+    #   ρ → 1 → loss 趋近零, prediction 高度可信, Path B 全力运行
+    rho = 0.0                # 当前学习进度
+    initial_loss = None      # L₀, 在第一步设定
+    smoothed_loss = None     # L(t), EMA 平滑
+    rho_ema_beta = 0.95      # smoothed loss 的 EMA 系数
+
     # ----- 训练循环 -----
     for epoch in range(CONFIG['epochs']):
         model.train()
@@ -369,18 +405,38 @@ def train_ring_inpainting():
         # 5. 手动反向传播 (复数力向量直接传入, 无缝合)
         model.manual_backward(force, CONFIG['lr'], CONFIG['weight_decay'])
 
-        # 6. [v2] Path B: Target 侧 embedding 更新 (双向纠缠)
-        #    让 target embedding 也向 prediction 方向微弱移动,
-        #    防止高 vocab 下 target embedding 成为静态"死区"。
-        reaction_lr = CONFIG['lr'] * CONFIG['reaction_scale']
-        if reaction_lr > 0 and valid_mask.any():
+        # 6. [v3] 更新 ρ(t) 学习进度
+        #
+        # 首步: 记录 L₀ (初始 loss)
+        # 后续: EMA 平滑当前 loss, 计算 ρ = clamp((L₀ - L_smoothed) / L₀, 0, 1)
+        if initial_loss is None:
+            initial_loss = loss_val
+            smoothed_loss = loss_val
+        else:
+            smoothed_loss = rho_ema_beta * smoothed_loss + (1.0 - rho_ema_beta) * loss_val
+
+        if initial_loss > 1e-12:
+            rho = max(0.0, min(1.0, (initial_loss - smoothed_loss) / initial_loss))
+        else:
+            rho = 0.0
+
+        # 7. [v3] Path B: Target 侧 embedding 更新 (ρ(t) 软缩放)
+        #
+        # 有效学习率 = lr * reaction_scale * ρ(t)
+        #
+        # 训练初期 ρ≈0: Path B 几乎不施力 (prediction 方向不可靠)
+        # 训练后期 ρ→1: Path B 以 reaction_scale 的全力运行
+        #
+        # 力方向 = -force (反作用力: 让 target 向 prediction 微弱移动)
+        reaction_lr = CONFIG['lr'] * CONFIG['reaction_scale'] * rho
+        if reaction_lr > 1e-12 and valid_mask.any():
             valid_target_ids = target_ids[valid_mask]
             valid_reaction = -force[valid_mask]
             model.embedding.manual_backward_explicit(
                 grad=valid_reaction,
                 indices=valid_target_ids,
                 lr=reaction_lr,
-                weight_decay=CONFIG['weight_decay'],
+                weight_decay=0.0,  # [v3] embedding 不施加 weight decay
             )
 
         # ----- 日志与评估 -----
@@ -401,9 +457,9 @@ def train_ring_inpainting():
             if vis is not None:
                 vis.record(epoch, loss_val, acc)
 
-            # 打印日志
+            # 打印日志 (含 ρ 学习进度)
             print(f"Epoch {epoch:04d} | L_Elegant: {loss_val:.6f} | "
-                  f"Acc: {acc:.2%} ({n_ok}/{n_tot})")
+                  f"Acc: {acc:.2%} ({n_ok}/{n_tot}) | ρ: {rho:.3f}")
 
             # Debug: 显示一个样本的修复情况
             sample_mask = (target_ids[0] != -100)
@@ -439,12 +495,16 @@ def train_ring_inpainting():
                 emb_mag = emb_w.abs().mean().item()
                 emb_phase_std = torch.angle(emb_w).std().item()
 
+                # [v3] Embedding RMS (模长稳定性监控, 替代已删除的 RMS 稳态)
+                emb_rms = torch.sqrt(emb_w.abs().pow(2).mean()).item()
+
                 # PhaseTwist 参数监控
                 act = model.block.act  # TransformerBlock 内的 PhaseTwist
                 gamma_mean = act.gamma.data.abs().mean().item()
                 beta_mean = act.beta.data.abs().mean().item()
 
                 print(f"   [Diag] Emb|w|: {emb_mag:.4f} | "
+                      f"EmbRMS: {emb_rms:.4f} | "
                       f"Phase σ: {emb_phase_std:.4f} | "
                       f"|γ|: {gamma_mean:.6f} | |β|: {beta_mean:.6f}")
 
@@ -471,6 +531,7 @@ def train_ring_inpainting():
     print()
     print("=" * 70)
     print(f" Training Complete. Best Accuracy: {best_acc:.2%}")
+    print(f" Final ρ: {rho:.3f}")
     print("=" * 70)
 
     # ----- 最终可视化分析 -----
@@ -485,7 +546,7 @@ def train_ring_inpainting():
     else:
         print("[INVESTIGATE] 准确率过低, 需要检查:")
         print("  1. 能量 (loss) 是否在下降")
-        print("  2. Embedding 模长是否正常 (应在 1.0 附近)")
+        print("  2. Embedding RMS 是否在合理范围 (0.5~3.0)")
         print("  3. Gamma 是否归零 (线性坍缩征兆)")
 
 

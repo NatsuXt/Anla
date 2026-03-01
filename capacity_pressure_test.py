@@ -256,7 +256,8 @@ class AnlaManifoldInpainter(nn.Module):
     def manual_backward(self, force: torch.Tensor, lr: float, wd: float):
         grad = self.block.manual_backward(force, lr, wd)
         grad = self.rotary.manual_backward(grad)
-        self.embedding.manual_backward(grad, lr, wd)
+        # [v3] Embedding 层不施加 weight decay (L_Elegant 尺度不变, 无力抵抗收缩)
+        self.embedding.manual_backward(grad, lr, weight_decay=0.0)
 
 
 # =====================================================================
@@ -564,6 +565,8 @@ def train_single_config(
         "loss": [],
         "train_acc": [],
         "test_acc": [],
+        "rho": [],           # [v3] 学习进度
+        "emb_rms": [],        # [v3] embedding 模长稳定性
     }
 
     best_train_acc = 0.0
@@ -574,6 +577,16 @@ def train_single_config(
 
     # [v2] 平滑 Loss 追踪 (用于早停)
     loss_tracker = SmoothedLossTracker(ema_beta=0.9)
+
+    # [v3] ρ(t) 学习进度追踪 (控制 Path B 的有效力度)
+    #
+    # ρ(t) = clamp((L₀ - L_smoothed(t)) / L₀, 0, 1)
+    #   ρ ≈ 0 → 模型未学到东西, prediction 不可靠, Path B 几乎关闭
+    #   ρ → 1 → loss 趋近零, prediction 可信, Path B 全力运行
+    rho = 0.0
+    rho_initial_loss = None     # L₀
+    rho_smoothed_loss = None    # L(t), EMA 平滑
+    rho_ema_beta = 0.95         # EMA 系数
 
     t_start = time.time()
 
@@ -601,16 +614,31 @@ def train_single_config(
         # 反向传播
         model.manual_backward(force, lr, wd)
 
-        # [v2] Path B: Target 侧 embedding 更新
-        reaction_lr = lr * reaction_scale
-        if reaction_lr > 0 and valid_mask.any():
+        # [v3] 更新 ρ(t) 学习进度
+        if rho_initial_loss is None:
+            rho_initial_loss = loss_val
+            rho_smoothed_loss = loss_val
+        else:
+            rho_smoothed_loss = (rho_ema_beta * rho_smoothed_loss
+                                 + (1.0 - rho_ema_beta) * loss_val)
+
+        if rho_initial_loss > 1e-12:
+            rho = max(0.0, min(1.0,
+                    (rho_initial_loss - rho_smoothed_loss) / rho_initial_loss))
+        else:
+            rho = 0.0
+
+        # [v3] Path B: Target 侧 embedding 更新 (ρ(t) 软缩放)
+        # 有效学习率 = lr * reaction_scale * ρ(t)
+        reaction_lr = lr * reaction_scale * rho
+        if reaction_lr > 1e-12 and valid_mask.any():
             valid_target_ids = target_ids[valid_mask]
             valid_reaction = -force[valid_mask]
             model.embedding.manual_backward_explicit(
                 grad=valid_reaction,
                 indices=valid_target_ids,
                 lr=reaction_lr,
-                weight_decay=wd,
+                weight_decay=0.0,  # [v3] embedding 不施加 weight decay
             )
 
         # ---- 评估 ----
@@ -634,16 +662,24 @@ def train_single_config(
                     test_acc, _, _ = evaluate_nearest_neighbor(
                         z_test, test_target, all_embeds)
 
+            # [v3] 计算 embedding RMS (模长稳定性监控)
+            emb_rms = torch.sqrt(
+                model.embedding.weight.data[:vocab_size].abs().pow(2).mean()
+            ).item()
+
             # 记录
             history["epochs"].append(epoch)
             history["loss"].append(loss_val)
             history["train_acc"].append(train_acc)
             history["test_acc"].append(test_acc)
+            history["rho"].append(rho)
+            history["emb_rms"].append(emb_rms)
 
             # 打印
             test_str = f" | Test: {test_acc:.2%}" if test_acc >= 0 else ""
             print(f"  [{cfg['name']}] Epoch {epoch:05d} | "
-                  f"Loss: {loss_val:.6f} | Train: {train_acc:.2%}{test_str}")
+                  f"Loss: {loss_val:.6f} | Train: {train_acc:.2%}{test_str}"
+                  f" | ρ: {rho:.3f} | EmbRMS: {emb_rms:.3f}")
 
             # Early stopping 检查
             if train_acc > best_train_acc or \
@@ -718,6 +754,7 @@ def train_single_config(
     result = {
         "config": cfg,
         "effective_weight_decay": wd,
+        "final_rho": rho,              # [v3] 最终学习进度
         "vocab_d_ratio": ratio,
         "total_params": total_params,
         "training_time_sec": round(t_elapsed, 1),
@@ -752,6 +789,7 @@ def train_single_config(
         print(f"    TDA dominant: {tda['dominant_persistence']:.4f}")
         print(f"    TDA ratio: {tda['dominance_ratio']:.4f}")
     print(f"    Weight Decay (effective): {wd:.2e}")
+    print(f"    Final ρ: {rho:.3f}")
     print(f"    用时: {t_elapsed:.0f}s")
     print()
 

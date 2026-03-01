@@ -1,11 +1,18 @@
 """
+保存位置: Anla/layers/normalization.py
 
 复数 RMS Normalization
 =========================================================================
 
+v4 变更:
+    scale 参数的优化器: RMSProp → 完整 Adam (一阶矩 + 偏差校正)
+    通过 AdaptiveParamState 的内部升级自动获得, 本文件代码不变。
+    · [+] 动量: 平滑 scale 的梯度, 减少训练初期的震荡
+    · [+] 偏差校正: 替代 init_energy 冷启动保护
+    · [Δ] β₂: 0.90 → 0.99
+
 v2 变更:
-    scale 参数的裸 SGD → AdaptiveParamState (β=0.90, eps=1e-5, init=1e-3)
-    与 ComplexLinear 使用完全一致的优化器参数。
+    scale 参数的裸 SGD → AdaptiveParamState (当时为 RMSProp)
 
     前向和输入梯度数学完全不变。
 """
@@ -19,6 +26,7 @@ class ComplexRMSNorm(ComplexLayer):
     """
     复数 RMS Normalization
 
+    v4: scale 参数的 AdaptiveParamState 内部升级为 Adam。
     v2: scale 参数配备 AdaptiveParamState, 替代裸 SGD。
     """
 
@@ -28,7 +36,7 @@ class ComplexRMSNorm(ComplexLayer):
         self.normalized_shape = normalized_shape
         self.scale = nn.Parameter(torch.ones(normalized_shape, dtype=torch.float32))
 
-        # [v2] 自适应优化器 (参数与 ComplexLinear 完全一致)
+        # [v4] Adam 优化器 (参数含动量 + 偏差校正)
         self._scale_optim = AdaptiveParamState(shape=(normalized_shape,))
 
     def _ensure_optim_device(self):
@@ -58,8 +66,7 @@ class ComplexRMSNorm(ComplexLayer):
         total_samples = grad_scale_flat.shape[0]
         grad_scale = torch.sum(grad_scale_flat, dim=0) / total_samples
 
-        # [v2] 使用 AdaptiveParamState 替代裸 SGD
-        # 原版: self.scale.data -= learning_rate * grad_scale
+        # [v4] Adam 更新 (含动量 + 偏差校正)
         self._scale_optim.step(self.scale, grad_scale, learning_rate)
 
         # 输入梯度 (完全不变)

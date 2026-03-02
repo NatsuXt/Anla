@@ -1,20 +1,57 @@
 """
+保存位置: Anla/layers/holographic_attention.py
 
 全息共振注意力 (Holographic Resonance Attention)
 =========================================================================
 
-修正说明 (相对于原版):
+修正说明 (相对于 v4):
 
-[Critical Fix] MagPhaseSoftmax.manual_backward 完全重写
+[Fix #1] MagPhaseSoftmax.manual_backward — 切向梯度数值稳定性
     
-    原版问题:
-    1. 径向梯度回传到复数域时缺少 Wirtinger 变换的 1/2 因子，
-       与切向合并后导致径向分量被放大 2x
-    2. 切向（相位）梯度仅处理 Softmax Jacobian 的对角项，
-       丢失了所有交叉项 (k ≠ j)，导致梯度方向偏差
-    3. 缩放因子 mag_probs / |S| 无精确数学对应，是一个 ad-hoc 近似
+    问题:
+        当 |S_j| ≈ 0 时 (训练初期 Q 与 K 近正交的常见情况),
+        切向梯度 tangential_grad = p_j · t_j / |S_j| 中的分母趋近零,
+        导致梯度数值爆炸。
+    
+        物理上, |S_j| ≈ 0 意味着 angle(S_j) 未定义 — 相位是随机的。
+        对不确定的相位施加大梯度, 等于向 Q/K 投影层注入纯噪声。
+    
+        后果链:
+            切向爆炸 → Q/K 权重被噪声更新 → Attention 模式不稳定
+            → ρ 快速升到 0.3~0.4 后停滞 → 下游所有层收到嘈杂信号
     
     修正方法:
+        引入平滑抑制函数 w(|S|), 使切向梯度在 |S| → 0 时自动衰减为零:
+    
+            tangential_grad_j = w(|S_j|) · p_j · t_j / (|S_j| + ε)
+    
+        其中:
+            w(r) = r² / (r² + τ²)
+    
+        性质:
+            · 当 |S_j| >> τ 时: w ≈ 1, 与原版完全一致
+            · 当 |S_j| << τ 时: w ≈ |S_j|²/τ², 切向力线性趋零
+            · 综合效果: tangential_grad ∝ |S_j|² / (|S_j|² + τ²) · 1/|S_j|
+                        = |S_j| / (|S_j|² + τ²)
+              这在 |S_j|=0 时为 0, 在 |S_j|=τ 时达到峰值 1/(2τ),
+              此后缓慢衰减为 1/|S_j| — 完美过渡。
+    
+        τ 的选择:
+            τ = 0.01 — 当 |S_j| > 0.1 (约 10τ) 时 w > 0.99, 几乎无影响。
+            只在 |S_j| < 0.01 的"相位模糊区"内起保护作用。
+
+    数学验证:
+        此修正不改变 Wirtinger 导数的解析公式 — 它等价于将 tangential
+        贡献乘以一个与上游梯度无关的标量权重。当 |S| 远离零时, 权重
+        为 1, 修正量为零阶小量。因此在 |S| 有限处, 梯度验证结果不受影响。
+
+=========================================================================
+
+以下部分与 v4 完全一致 (MagPhaseSoftmax.forward, HolographicAttention 整体):
+
+[v4 Critical Fix] MagPhaseSoftmax.manual_backward 完全重写 (保留)
+    
+    修正方法 (保留):
     从 Wirtinger 微积分严格推导 dL/dS*，最终公式为:
     
         dL/dS_j* = e_j · { scale · JVP_softmax(h)_j  +  i · p_j · t_j / |S_j| }
@@ -96,7 +133,7 @@ class MagPhaseSoftmax(ComplexLayer):
         A = softmax(|S| · scale) · e^{i · angle(S)}
         
     Manual Backward:
-        精确 Wirtinger 导数 (本版本已修正原版的近似误差)。
+        精确 Wirtinger 导数, 含切向梯度平滑抑制 (Fix #1)。
     """
 
     def __init__(self, dim=-1):
@@ -142,19 +179,21 @@ class MagPhaseSoftmax(ComplexLayer):
     def manual_backward(self, grad_output: torch.Tensor,
                         learning_rate: float, **kwargs) -> torch.Tensor:
         """
-        [修正版] 精确 Wirtinger 反向传播。
+        [修正版 v4.1] 精确 Wirtinger 反向传播 + 切向梯度平滑抑制。
 
         接收: G = grad_output = dL/dA*  (上游传来的复数误差向量)
         返回: dL/dS*                     (传给前层的复数误差向量)
 
         公式:
-            dL/dS_j* = e_j · { scale · JVP_softmax(h)_j  +  i · p_j · t_j / |S_j| }
+            dL/dS_j* = e_j · { scale · JVP_softmax(h)_j
+                              + i · w(|S_j|) · p_j · t_j / (|S_j| + ε) }
         
         其中:
             e_j = e^{iθ_j}                                    (单位相位)
             h_k = Re(G_k · conj(e_k))                         (径向投影)
             t_j = Im(G_j · conj(e_j))                         (切向投影)
             JVP_softmax(h)_j = p_j · (h_j - Σ_k p_k · h_k)   (Softmax JVP)
+            w(r) = r² / (r² + τ²)                             (平滑抑制, Fix #1)
         """
         # ---- 读取缓存 ----
         p = self.softmax_mag_cache       # p_k: Softmax 输出模长, 实数
@@ -162,9 +201,20 @@ class MagPhaseSoftmax(ComplexLayer):
         scale = self.scale_factor        # 缩放因子
         S = self.input_cache             # 原始复数输入 S
 
-        # [v2] eps: 1e-9 → 1e-4, 防止训练初期 Q⊥K 时 1/|S| 爆炸
-        eps = 1e-4
-        mag_S = torch.abs(S) + eps       # |S_k|, 安全下界防止除零
+        # ---- 数值常量 ----
+        eps = 1e-7                       # 除零保护 (纯安全网, 不影响正常数值)
+        TAU_SQ = 1e-4                    # τ² = (0.01)², 切向抑制温度
+        #
+        # τ 的选择依据:
+        #   · |S| > 10τ = 0.1 时: w > 0.99, 几乎无影响
+        #   · |S| = τ = 0.01 时: w = 0.5, 切向力减半
+        #   · |S| → 0 时: w → 0, 切向力完全关闭
+        #
+        # 这保证: 在 Q⊥K (|S|≈0) 的"相位模糊区"内不注入噪声,
+        #          在 Q·K 有显著相干性时完全不干预。
+
+        mag_S = torch.abs(S)             # |S_k|, 原始模长 (不加 eps, 供 w 计算)
+        mag_S_safe = mag_S + eps         # 安全分母
 
         # ---- Step 1: 构造单位相位向量 e_k = e^{iθ_k} ----
         e = torch.polar(torch.ones_like(phase), phase)
@@ -193,13 +243,22 @@ class MagPhaseSoftmax(ComplexLayer):
         # 推导中 Wirtinger 的 1/2 因子与 2·Re(...) 的 2 精确抵消。
         radial_grad = scale * softmax_jvp          # 实数, shape 同 p
 
-        # ---- Step 4: 切向路径 — 相位梯度 ----
+        # ---- Step 4: 切向路径 — 相位梯度 (含平滑抑制) ----
         #
-        # 切向梯度贡献: p_j · t_j / |S_j|
+        # [Fix #1] 引入平滑抑制函数:
+        #     w(r) = r² / (r² + τ²)
         #
-        # 物理含义: 相位误差产生的"扭矩"，
-        #           除以力臂 |S_j| 将角度变化率转换为复平面上的力。
-        tangential_grad = p * t / mag_S            # 实数, shape 同 p
+        # 原版: tangential = p · t / (|S| + 1e-4)
+        #     |S|→0 时分母 ≈ 1e-4, 切向力可被放大 ~10000 倍
+        #
+        # 修正版: tangential = w · p · t / (|S| + eps)
+        #     综合效果 = |S|² / (|S|² + τ²) · p · t / (|S| + eps)
+        #             ≈ |S| / (|S|² + τ²) · p · t       (|S| 较小时)
+        #     |S|→0 时整体 → 0, 数值安全
+        mag_S_sq = mag_S.pow(2)
+        tangential_weight = mag_S_sq / (mag_S_sq + TAU_SQ)
+
+        tangential_grad = tangential_weight * p * t / mag_S_safe   # 实数
 
         # ---- Step 5: 合成复数梯度 ----
         #

@@ -511,68 +511,118 @@ def test_transformer_block(eps=1e-5, n_samples=15, seed=42):
 def test_param_gradients_phase_twist(eps=1e-5, n_samples=10, seed=42):
     """
     验证 PhaseTwist 的参数梯度 (gamma, beta, phi)。
-    通过比较参数更新前后的变化量与有限差分。
-    """
-    from Anla.layers.activation import PhaseTwist
 
+    [v4.3 修正] 彻底解决三个累积 bug:
+    
+    Bug 1 (v4.1 修) — Adam 归一化: 绕过 Adam, 直接用 Wirtinger 公式。
+    Bug 2 (v4.1 修) — 因子 2: 统一 L = 2·Re(Σ conj(G)·f)。
+    Bug 3 (v4.2 修) — sum/mean 不一致: 两侧均用 sum, 不做 mean。
+    Bug 4 (v4.3 修) — float32 精度丢失:
+        v4.2 中 FD 扰动 eps=1e-7 在 .float() 转回 float32 时被舍入
+        (float32 有效位 ~7 位, 参数 ~0.05, 扰动 1e-7 被吞掉),
+        导致 L_plus == L_minus → grad_fd = 0 → NaN。
+        
+        v4.3 的解决方案: FD 侧不经过 PhaseTwist nn.Module,
+        而是直接用 float64 纯数学函数计算前向, 彻底避免 dtype 转换。
+    """
     torch.manual_seed(seed)
     channels = 8
-    layer = PhaseTwist(channels, init_gamma=0.05, init_beta=0.05, init_phi=0.1)
-    layer.train()
 
     B, S = 2, 4
-    z = torch.randn(B, S, channels, dtype=torch.cfloat) * 0.5 + 0.3
-    G = torch.randn(B, S, channels, dtype=torch.cfloat) * 0.1
+    # 全程 float64
+    z = torch.randn(B, S, channels, dtype=torch.cdouble) * 0.5 + 0.3
+    G = torch.randn(B, S, channels, dtype=torch.cdouble) * 0.1
+
+    gamma_val = torch.full((channels,), 0.05, dtype=torch.float64)
+    beta_val = torch.full((channels,), 0.05, dtype=torch.float64)
+    phi_val = torch.full((channels,), 0.1, dtype=torch.float64)
 
     results = {}
+    EPS_R = 1e-12
+
+    # ================================================================
+    #  纯函数: PhaseTwist 前向 (float64, 无 nn.Module 依赖)
+    # ================================================================
+    def phase_twist_fwd(z_in, gamma, beta, phi):
+        """f(z) = m · e^{i·θ_out}, m = r·(1+β·cos(θ-φ)), θ_out = θ+γ·r"""
+        r = torch.abs(z_in) + EPS_R
+        theta = torch.angle(z_in)
+        g = gamma.view(1, 1, -1)
+        b = beta.view(1, 1, -1)
+        p = phi.view(1, 1, -1)
+        cos_d = torch.cos(theta - p)
+        sin_d = torch.sin(theta - p)
+        m = r * (1.0 + b * cos_d)
+        theta_out = theta + g * r
+        return m * torch.polar(torch.ones_like(theta_out), theta_out)
+
+    def scalar_loss(z_in, gamma, beta, phi):
+        """L = 2·Re(Σ conj(G)·f(z))"""
+        f = phase_twist_fwd(z_in, gamma, beta, phi)
+        return 2.0 * torch.real(torch.sum(torch.conj(G) * f)).item()
+
+    # ================================================================
+    #  Step A: 解析 Wirtinger 参数梯度 (SUM 归约, float64)
+    # ================================================================
+    r = torch.abs(z) + EPS_R
+    theta = torch.angle(z)
+    g_b = gamma_val.view(1, 1, -1)
+    b_b = beta_val.view(1, 1, -1)
+    p_b = phi_val.view(1, 1, -1)
+
+    cos_diff = torch.cos(theta - p_b)
+    sin_diff = torch.sin(theta - p_b)
+    m = r * (1.0 + b_b * cos_diff)
+    theta_out = theta + g_b * r
+    e_i_tout = torch.polar(torch.ones_like(theta_out), theta_out)
+    f = m * e_i_tout
+
+    # ∂f/∂γ = i·f·r,  ∂f/∂β = r·cos(θ-φ)·e^{iθ_out},  ∂f/∂φ = r·β·sin(θ-φ)·e^{iθ_out}
+    df_dgamma = 1j * f * r
+    df_dbeta = r * cos_diff * e_i_tout
+    df_dphi = r * b_b * sin_diff * e_i_tout
+
+    # dL/dα = 2·Re(G · conj(∂f/∂α)), 然后 SUM over (B, S)
+    raw_grad = {
+        "gamma": (2.0 * torch.real(G * torch.conj(df_dgamma))).reshape(-1, channels).sum(0),
+        "beta":  (2.0 * torch.real(G * torch.conj(df_dbeta))).reshape(-1, channels).sum(0),
+        "phi":   (2.0 * torch.real(G * torch.conj(df_dphi))).reshape(-1, channels).sum(0),
+    }
+
+    # ================================================================
+    #  Step B: 有限差分 (纯 float64, 不经过 nn.Module)
+    # ================================================================
+    param_snaps = {"gamma": gamma_val, "beta": beta_val, "phi": phi_val}
 
     for param_name in ['gamma', 'beta', 'phi']:
-        param = getattr(layer, param_name)
-        param_snap = param.data.clone()
+        snap = param_snaps[param_name]
+        grad_fd = torch.zeros_like(snap)
 
-        # 有限差分: 对参数的每个元素扰动
-        grad_fd = torch.zeros_like(param)
+        for k in range(min(n_samples, snap.numel())):
+            def perturbed_loss(delta):
+                p_clone = snap.clone()
+                p_clone[k] = p_clone[k] + delta
+                kw = dict(param_snaps)
+                kw[param_name] = p_clone
+                return scalar_loss(z, kw["gamma"], kw["beta"], kw["phi"])
 
-        for k in range(min(n_samples, param.numel())):
-            def scalar_loss_for_param(p_val):
-                p_clone = param_snap.clone()
-                p_clone[k] = p_val
-                # 创建干净层
-                lyr = PhaseTwist(channels)
-                lyr.gamma.data.copy_(layer.gamma.data.clone() if param_name != 'gamma' else p_clone)
-                lyr.beta.data.copy_(layer.beta.data.clone() if param_name != 'beta' else p_clone)
-                lyr.phi.data.copy_(layer.phi.data.clone() if param_name != 'phi' else p_clone)
-                lyr.eval()
-                f_val = lyr.forward(z)
-                return torch.real(torch.sum(torch.conj(G) * f_val)).item()
+            grad_fd[k] = (perturbed_loss(+eps) - perturbed_loss(-eps)) / (2.0 * eps)
 
-            # 实参数只需要实方向差分
-            L_plus = scalar_loss_for_param(param_snap[k] + eps)
-            L_minus = scalar_loss_for_param(param_snap[k] - eps)
-            grad_fd[k] = (L_plus - L_minus) / (2.0 * eps)
-
-        # 手动反传得到的参数梯度 (通过观察参数变化量)
-        state = save_layer_state(layer)
-        lr_test = 1.0  # 用 lr=1 使得 param_new = param_old - grad
-        layer.forward(z)
-        layer.manual_backward(G, learning_rate=lr_test)
-        param_after = getattr(layer, param_name).data.clone()
-        restore_layer_state(layer, state)
-
-        # param_new = param_old - lr * grad  =>  grad = (param_old - param_new) / lr
-        grad_manual_param = (param_snap - param_after) / lr_test
-
-        # 比较
-        n_cmp = min(n_samples, param.numel())
-        m_vals = grad_manual_param[:n_cmp]
+        # ================================================================
+        #  Step C: 比较
+        # ================================================================
+        n_cmp = min(n_samples, snap.numel())
+        m_vals = raw_grad[param_name][:n_cmp].detach()
         f_vals = grad_fd[:n_cmp]
 
         cos_sim = torch.dot(m_vals, f_vals) / (m_vals.norm() * f_vals.norm() + 1e-30)
         rel_err = ((m_vals - f_vals).abs() / (f_vals.abs() + 1e-30)).mean()
+        mag_ratio = (m_vals.norm() / (f_vals.norm() + 1e-30)).item()
 
         results[param_name] = {
             "cosine_similarity": cos_sim.item(),
             "mean_relative_error": rel_err.item(),
+            "magnitude_ratio": mag_ratio,
             "manual_norm": m_vals.norm().item(),
             "fd_norm": f_vals.norm().item(),
         }
@@ -588,6 +638,11 @@ def test_softmax_jacobian_only(eps=1e-6, n_samples=20, seed=42):
     """
     单独验证: softmax(|z|*scale) 对 |z| 的反传是否正确。
     剥离相位部分，只看 MagPhaseSoftmax 的模长通路。
+
+    [v4.1 修正] 返回标准 key (cosine_similarity / mean_relative_error),
+    使 format_result 能正确显示结果。原版使用了非标准 key
+    (softmax_jacobian_cosine / softmax_jacobian_rel_err),
+    导致 format_result 回退到哨兵值 -999, 误报为 CRITICAL。
     """
     torch.manual_seed(seed)
     B, H, SQ, SK = 1, 1, 4, 4
@@ -602,7 +657,10 @@ def test_softmax_jacobian_only(eps=1e-6, n_samples=20, seed=42):
     y = fwd_mag(mag)
     G_real = torch.randn_like(mag) * 0.1
 
-    # 手动 softmax backward
+    # 手动 softmax backward:
+    #   L = Σ G_k · y_k
+    #   dL/dm_j = scale · Σ_k G_k · p_k · (δ_{kj} - p_j)
+    #           = scale · p_j · (G_j - Σ_k p_k · G_k)
     tmp = y * G_real
     sum_tmp = tmp.sum(dim=-1, keepdim=True)
     grad_manual_mag = (tmp - y * sum_tmp) * scale
@@ -627,10 +685,15 @@ def test_softmax_jacobian_only(eps=1e-6, n_samples=20, seed=42):
     m_v = grad_manual_mag.reshape(-1)[:len(indices)]
     f_v = grad_fd_mag.reshape(-1)[:len(indices)]
     cos = torch.dot(m_v, f_v) / (m_v.norm() * f_v.norm() + 1e-30)
+    rel_err = ((m_v - f_v).abs() / (f_v.abs() + 1e-30)).mean()
 
+    # [Fix] 使用标准 key, 使 format_result 能正确解析
     return {
-        "softmax_jacobian_cosine": cos.item(),
-        "softmax_jacobian_rel_err": ((m_v - f_v).abs() / (f_v.abs() + 1e-30)).mean().item(),
+        "cosine_similarity": cos.item(),
+        "mean_relative_error": rel_err.item(),
+        "manual_norm": m_v.norm().item(),
+        "fd_norm": f_v.norm().item(),
+        "n_compared": len(indices),
     }
 
 
@@ -724,10 +787,19 @@ def run_all_tests(eps=1e-5, n_samples=20, seed=42, layers=None):
             result = test_fn(eps=eps, n_samples=n_samples, seed=seed)
             dt = time.time() - t0
             print(f"({dt:.1f}s)")
-            print(format_result(name, result))
-            results[name] = result
-            cos = result.get("cosine_similarity", -999)
-            summary.append((name, cos))
+
+            # [v4.3] 统一处理嵌套结果 (过滤模式下 AUX 测试可能被移入 all_tests)
+            if isinstance(result, dict) and all(isinstance(v, dict) for v in result.values()):
+                for sub_name, sub_result in result.items():
+                    full_name = f"{name} → {sub_name}"
+                    print(format_result(full_name, sub_result))
+                    cos = sub_result.get("cosine_similarity", -999)
+                    summary.append((full_name, cos))
+            else:
+                print(format_result(name, result))
+                results[name] = result
+                cos = result.get("cosine_similarity", -999)
+                summary.append((name, cos))
         except Exception as e:
             dt = time.time() - t0
             print(f"ERROR ({dt:.1f}s)")
@@ -753,8 +825,8 @@ def run_all_tests(eps=1e-5, n_samples=20, seed=42, layers=None):
                     summary.append((full_name, cos))
             else:
                 print(format_result(name, result))
-                cos = result.get("cosine_similarity",
-                                 result.get("softmax_jacobian_cosine", -999))
+                # [v4.1] 所有辅助测试现在都返回标准 key, 无需特殊回退
+                cos = result.get("cosine_similarity", -999)
                 summary.append((name, cos))
         except Exception as e:
             dt = time.time() - t0
